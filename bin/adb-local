@@ -1,0 +1,61 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# Connect adb from Termux to this same phone over wireless debugging.
+#   adb-local                      reconnect to 127.0.0.1:5555 (works on cellular until reboot)
+#   adb-local pair <port> <code>   one-time pairing ("Pair device with pairing code" dialog)
+#   adb-local <port>               connect using the port shown on the Wireless debugging
+#                                  screen, then switch to 127.0.0.1:5555
+set -eu
+
+LOCAL=127.0.0.1:5555
+
+usage() { sed -n '2,6s/^# \{0,1\}//p' "$0"; }
+
+wifi_ip() {
+  ifconfig wlan0 2>/dev/null | awk '/inet /{print $2; exit}'
+}
+
+wait_ready() { # serial
+  local i state
+  for i in $(seq 1 24); do
+    state="$(adb devices | awk -v s="$1" '$1==s{print $2}')"
+    case "$state" in
+      device) return 0 ;;
+      unauthorized|offline)
+        [ "$i" = 1 ] && echo "Tap 'Allow' on the USB debugging prompt (tick 'Always allow')."
+        [ $((i % 4)) = 0 ] && { adb disconnect "$1" >/dev/null 2>&1; adb connect "$1" >/dev/null 2>&1 || true; } ;;
+    esac
+    sleep 5
+  done
+  echo "Device $1 is not ready (state: ${state:-missing})." >&2
+  return 1
+}
+
+case "${1:-}" in
+  -h|--help) usage ;;
+  pair)
+    [ $# -eq 3 ] || { usage; exit 1; }
+    ip="$(wifi_ip)"; [ -n "$ip" ] || { echo "Not on Wi-Fi; pairing needs Wi-Fi." >&2; exit 1; }
+    adb pair "$ip:$2" "$3"
+    echo "Paired. Now run: adb-local <port shown under 'IP address & Port'>"
+    ;;
+  "")
+    if adb connect "$LOCAL" | grep -q '^connected\|already connected'; then
+      wait_ready "$LOCAL" && adb devices -l
+    else
+      echo "Could not connect to $LOCAL (normal after a reboot)." >&2
+      echo "Turn on Wi-Fi and Wireless debugging, then run: adb-local <port>" >&2
+      exit 1
+    fi
+    ;;
+  *[!0-9]*) usage; exit 1 ;;
+  *)
+    ip="$(wifi_ip)"; [ -n "$ip" ] || { echo "Not on Wi-Fi; Wireless debugging needs Wi-Fi." >&2; exit 1; }
+    adb connect "$ip:$1"
+    wait_ready "$ip:$1"
+    adb -s "$ip:$1" tcpip 5555
+    sleep 3
+    adb connect "$LOCAL"
+    adb disconnect "$ip:$1" >/dev/null 2>&1 || true
+    wait_ready "$LOCAL" && adb devices -l
+    ;;
+esac

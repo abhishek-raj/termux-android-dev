@@ -1,0 +1,48 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# Start an app under the debugger and attach jdb.
+#   adb-debug <package> [jdb command]...
+#   adb-debug --attach <package> [jdb command]...   attach to the running app instead
+# Default breakpoint: stop in <launcher activity>.onCreate
+# Example: adb-debug com.example.hello "stop at com.example.hello.MainActivity:12"
+# Run it from your project folder so 'list' can show source (app/src/main/java).
+set -eu
+
+PORT="${JDWP_PORT:-8700}"
+attach=0
+[ "${1:-}" = --attach ] && { attach=1; shift; }
+[ $# -ge 1 ] || { sed -n '2,7s/^# \{0,1\}//p' "$0"; exit 1; }
+pkg="$1"; shift
+
+# adb lists localhost:5555 twice (also as emulator-5554); pick the local one.
+[ -n "${ANDROID_SERIAL:-}" ] || export ANDROID_SERIAL=127.0.0.1:5555
+adb get-state >/dev/null 2>&1 || { echo "No device. Run adb-local first." >&2; exit 1; }
+
+if [ "$attach" = 0 ]; then
+  activity="$(adb shell cmd package resolve-activity --brief --user 0 \
+    -c android.intent.category.LAUNCHER "$pkg" | tail -1 | tr -d '\r')"
+  case "$activity" in */*) ;; *) echo "No launcher activity found for $pkg." >&2; exit 1 ;; esac
+  adb shell am force-stop "$pkg"
+  adb shell am start -D -n "$activity" >/dev/null
+  case "$activity" in */.*) cls="$pkg${activity#*/}" ;; *) cls="${activity#*/}" ;; esac
+  [ $# -gt 0 ] || set -- "stop in $cls.onCreate"
+fi
+
+pid=""
+for _ in $(seq 1 20); do
+  pid="$(adb shell pidof "$pkg" | tr -d '\r')"
+  [ -n "$pid" ] && break
+  sleep 0.5
+done
+[ -n "$pid" ] || { echo "$pkg is not running." >&2; exit 1; }
+
+adb forward --remove "tcp:$PORT" >/dev/null 2>&1 || true
+adb forward "tcp:$PORT" "jdwp:$pid" >/dev/null
+trap 'adb forward --remove "tcp:$PORT" >/dev/null 2>&1 || true' EXIT
+trap 'exit 130' INT TERM
+
+src=()
+[ -d app/src/main/java ] && src=(-sourcepath app/src/main/java)
+echo "Attached to $pkg (pid $pid). Commands: where, locals, step, next, cont, list, exit"
+# Send breakpoints first so they are set before the app resumes, then hand over the keyboard.
+# Small heap: Android kills Termux under memory pressure.
+{ printf '%s\n' "$@"; cat; } | jdb -J-Xmx256m "${src[@]}" -attach "localhost:$PORT"
